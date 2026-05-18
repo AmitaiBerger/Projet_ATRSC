@@ -1,5 +1,5 @@
 using SimJulia, Distributions, Random, Statistics, ResumableFunctions, Printf
-using Plots  # <-- Ajout pour les graphiques
+using Plots
 
 # --- DONNÉES OFFICIELLES (inchangées) ---
 const λ = [0.29, 0.32, 0.47, 0.38]
@@ -21,7 +21,7 @@ mutable struct Produit
     id::Int
     type::Int
     arrivee_atelier::Float64
-    arrivee_machine::Float64 
+    arrivee_machine::Float64
     etape::Int
 end
 
@@ -49,11 +49,11 @@ mutable struct Atelier
     file_inactifs::Vector{Int}
     events_employes::Vector{Event}
     temps_sejour::Vector{Float64}
-    temps_sejour_history::Vector{Tuple{Float64,Float64}}  # (temps de fin, temps de séjour) pour le tracé
+    temps_sejour_history::Vector{Tuple{Float64,Float64}}
     compteur_produits::Int
     fin_transitoire::Float64
     verbose::Bool
-    record_history::Bool                                   # active l'enregistrement pour le tracé
+    record_history::Bool
     function Atelier(sim, Q, verbose, record_history)
         nb_machines = 8
         nb_emp = size(Q,1)
@@ -66,8 +66,8 @@ end
 
 # --- FONCTION DE LOG ---
 log_event(atelier::Atelier, msg::String) = atelier.verbose && println("[t=$(Printf.@sprintf("%.3f", now(atelier.sim)))] $msg")
-                
-# --- FONCTIONS AUXILIAIRES (inchangées) ---
+
+# --- FONCTIONS AUXILIAIRES ---
 
 function par_temps_entree(atelier::Atelier, id::Int)
     return atelier.employes[id].temps_entree_salle
@@ -114,99 +114,92 @@ function choisir_employe_pour_machine(atelier::Atelier, machine_id::Int)
     return nothing
 end
 
-
 function temps_restant_employe(atelier::Atelier, emp_id::Int)
-
     emp = atelier.employes[emp_id]
-
-    # Employé libre
     if !emp.est_occupe
         return 0.0
     end
-
     m_id = emp.machine_assignee
-
-    # sécurité
     if m_id === nothing
         return 0.0
     end
-
     machine = atelier.machines[m_id]
-
     if machine.en_service === nothing
         return 0.0
     end
-
     p = machine.en_service
-
-    # temps moyen théorique
     a, b = TEMPS[(p.type, m_id)]
     temps_moyen = (a + b) / 2
-
-    # temps déjà passé sur la machine
     temps_deja = now(atelier.sim) - p.arrivee_machine
-
     return temps_moyen - temps_deja
 end
 
-
+# ---------------------------------------------------------------
+# BUG 1 CORRIGÉ : "endfte" → "end"
+# BUG 2 CORRIGÉ : mode_algo est maintenant utilisé pour brancher
+#                 entre FIFO et l'algorithme intelligent
+# ---------------------------------------------------------------
 function choisir_machine(atelier::Atelier, emp_id::Int,
                          mode_algo::String,
                          mode_choix::String)
 
     emp_ref = atelier.employes[emp_id]
 
+    # ---- MODE FIFO : on choisit la machine avec le produit le plus ancien ----
+    if mode_algo == "FIFO_ATELIER"
+        meilleure_machine = nothing
+        arrivee_min = Inf
+        for m_id in emp_ref.qualifications
+            machine = atelier.machines[m_id]
+            if isempty(machine.file_attente)
+                continue
+            end
+            idx = index_produit_doyen(machine.file_attente)
+            t = machine.file_attente[idx].arrivee_atelier
+            if t < arrivee_min
+                arrivee_min = t
+                meilleure_machine = m_id
+            end
+        end
+        if meilleure_machine !== nothing
+            log_event(atelier, "FIFO : Employé $emp_id → machine $meilleure_machine")
+        end
+        return meilleure_machine
+    end
+
+    # ---- MODE INTELLIGENT : on minimise le temps d'attente futur ----
     meilleure_machine = nothing
     pire_attente = -Inf
 
-    # On regarde toutes les machines compatibles
     for m_id in emp_ref.qualifications
-
         machine = atelier.machines[m_id]
-
-        # il faut une pièce en attente
         if isempty(machine.file_attente)
             continue
         end
 
-        # --- estimation du temps d'attente
-        # si l'employé courant NE prend PAS cette machine
-
+        # Temps d'attente estimé si l'employé courant NE prend PAS cette machine
         meilleur_temps = Inf
-
-        # chercher le premier autre employé capable
         for autre_id in 1:length(atelier.employes)
-
-            # ne pas prendre l'employé actuel
             if autre_id == emp_id
                 continue
             end
-
             autre = atelier.employes[autre_id]
-
-            # qualification nécessaire ?
             if !(m_id in autre.qualifications)
                 continue
             end
-
-            # temps avant libération
             t = temps_restant_employe(atelier, autre_id)
-
             if t < meilleur_temps
                 meilleur_temps = t
             end
         end
 
-        # aucun autre employé disponible
+        # Aucun autre employé qualifié : pénalité maximale
         if meilleur_temps == Inf
             meilleur_temps = 1e9
         end
 
-        log_event(atelier,
-            "Machine $m_id : attente estimée = $(round(meilleur_temps,digits=3))")
+        log_event(atelier, "Machine $m_id : attente estimée = $(round(meilleur_temps, digits=3))")
 
-        # on choisit la machine
-        # dont l'attente future serait la pire
         if meilleur_temps > pire_attente
             pire_attente = meilleur_temps
             meilleure_machine = m_id
@@ -215,12 +208,12 @@ function choisir_machine(atelier::Atelier, emp_id::Int,
 
     if meilleure_machine !== nothing
         log_event(atelier,
-            "Employé $emp_id choisit machine $meilleure_machine " *
-            "(attente évitée = $(round(pire_attente,digits=3)))")
+            "INTELLIGENT : Employé $emp_id → machine $meilleure_machine " *
+            "(attente évitée = $(round(pire_attente, digits=3)))")
     end
 
     return meilleure_machine
-endfte
+end  # ← BUG 1 CORRIGÉ : était "endfte"
 
 function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Float64)
     machine = atelier.machines[m_id]
@@ -247,9 +240,9 @@ function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Fl
     return nothing
 end
 
-# --- PROCESSUS (avec enregistrement historique si activé) ---
+# --- PROCESSUS ---
 
-@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier, 
+@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier,
                                       mode_algo::String, mode_choix::String)
     emp = atelier.employes[emp_id]
     while true
@@ -359,9 +352,9 @@ end
     end
 end
 
-# --- FONCTION DE SIMULATION AVEC OPTION GRAPHIQUE ---
+# --- FONCTION DE SIMULATION ---
 
-function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_TOT_ATELIER", 
+function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_TOT_ATELIER",
                            n_runs=20, duree_transient=10000.0, duree_permanent=1000.0;
                            verbose=false, plot_convergence=false)
     sejours_moyens = Float64[]
@@ -369,23 +362,23 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
     occupations = [Float64[] for _ in 1:nb_emp]
 
     for r in 1:n_runs
-        record_this_run = plot_convergence && (r == 1)   # seulement le premier run si demandé
+        record_this_run = plot_convergence && (r == 1)
         verbose && println("\n--- RUN $r ---")
         sim = Simulation()
         atelier = Atelier(sim, Q, verbose, record_this_run)
         atelier.fin_transitoire = duree_transient
-        
+
         @process processus_reinitialisation(sim, atelier, duree_transient)
-        
+
         for i in 1:nb_emp
             @process processus_employe(sim, i, atelier, mode_algo, mode_choix)
         end
         for t in 1:4
             @process generateur(sim, t, atelier)
         end
-        
+
         run(sim, duree_transient + duree_permanent)
-        
+
         if !isempty(atelier.temps_sejour)
             push!(sejours_moyens, mean(atelier.temps_sejour))
         end
@@ -394,20 +387,17 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
         end
         verbose && println("Fin run $r : produits terminés en phase permanente = $(length(atelier.temps_sejour))")
 
-        # --- Tracé pour le premier run si demandé ---
         if record_this_run && !isempty(atelier.temps_sejour_history)
-            # Calculer la moyenne cumulée
             history = atelier.temps_sejour_history
-            sort!(history, by = x -> x[1])  # tri par temps de fin
+            sort!(history, by = x -> x[1])
             temps = [t for (t, _) in history]
             sejours = [s for (_, s) in history]
             cum_mean = cumsum(sejours) ./ (1:length(sejours))
-            
-            p = plot(temps, cum_mean, 
+            p = plot(temps, cum_mean,
                      label = "Moyenne cumulée",
                      xlabel = "Temps simulé",
                      ylabel = "Temps de séjour moyen",
-                     title = "Convergence du temps de séjour - Instance $label (Run 1)")
+                     title = "Convergence - Instance $label | Algo: $mode_algo (Run 1)")
             vline!([duree_transient], linestyle=:dash, color=:red, label="Fin transitoire (t=$duree_transient)")
             display(p)
             println("Graphique de convergence affiché pour l'instance $label.")
@@ -417,26 +407,33 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
     m = mean(sejours_moyens)
     ic = 1.96 * std(sejours_moyens) / sqrt(n_runs)
     occ_moy = [mean(occupations[i]) for i in 1:nb_emp]
-    
+
     println("-"^60)
-    @printf("Instance %s | Algo: %-12s | Choix: %-15s\n", label, mode_algo, mode_choix)
-    @printf(" > Temps de séjour moyen : %.2f ± %.2f\n", m, ic)
-    @printf(" > Occupation employés : %s\n", join([@sprintf("%.1f%%", x) for x in occ_moy], ", "))
+    @printf("Instance %s | Algo: %-15s | Choix: %-15s\n", label, mode_algo, mode_choix)
+    @printf(" > Temps de séjour moyen : %.4f ± %.4f\n", m, ic)
+    @printf(" > Occupation employés   : %s\n", join([@sprintf("%.1f%%", x) for x in occ_moy], ", "))
 end
 
-# --- EXÉCUTION AVEC GRAPHIQUES ---
+# --- EXÉCUTION ---
 Q1 = [1 1 0 0 0 0 0 0; 0 0 1 1 0 0 0 0; 0 0 0 0 1 1 0 0; 0 0 0 0 0 0 1 1]
 Q2 = [1 0 1 0 0 1 0 0; 0 1 0 0 1 0 1 1; 0 1 0 1 1 0 0 1; 1 0 1 1 0 1 1 0]
 Q3 = [1 1 0 0 0 0 0 0; 0 0 1 0 0 0 0 0; 0 0 0 1 0 1 0 0; 0 0 0 0 1 0 0 1; 0 0 1 0 0 1 0 0; 1 0 0 0 0 0 1 0]
 Q4 = [1 1 1 0 0 0 0 0; 0 0 0 1 1 1 0 0; 1 0 1 0 0 1 1 1; 0 0 1 0 1 0 1 1; 0 1 0 0 0 1 1 0; 1 0 0 1 0 0 1 1]
 
 Random.seed!(123)
-println("LANCEMENT DE L'ÉTUDE COMPARATIVE AVEC GRAPHIQUES DE CONVERGENCE")
+println("="^60)
+println("ALGO FIFO (Q4)")
+println("="^60)
+etude_performance(Q1, "I1", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
+etude_performance(Q2, "I2", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
+etude_performance(Q3, "I3", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
+etude_performance(Q4, "I4", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
 
-# Attention, verbose:true affiche tous les événements ; à n'utiliser que sur des simulations très très courtes 
-# Utile essentiellement pour débuguer
-
-etude_performance(Q1, "I1", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=true)
-etude_performance(Q2, "I2", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=true)
-etude_performance(Q3, "I3", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=true)
-etude_performance(Q4, "I4", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=true)
+println()
+println("="^60)
+println("ALGO INTELLIGENT (Q6)")
+println("="^60)
+etude_performance(Q1, "I1", "INTELLIGENT", "PLUS_TOT_ATELIER")
+etude_performance(Q2, "I2", "INTELLIGENT", "PLUS_TOT_ATELIER")
+etude_performance(Q3, "I3", "INTELLIGENT", "PLUS_TOT_ATELIER")
+etude_performance(Q4, "I4", "INTELLIGENT", "PLUS_TOT_ATELIER")
