@@ -7,12 +7,11 @@ using Printf
 using Plots
 
 times = Float64[]
-nb_pieces_per_times = Int[]
-current_nb_of_pieces = 0
+nb_pieces = Int[]                    # ← était "nb_pieces_per_times", nom incohérent
+current_nbo = Ref{Int}(0)           # ← était "current_nb_of_pieces = 0", doit être un Ref pour être modifiable dans les @resumable
 
-@resumable function piece(env::Environment, name::Int, machine::Resource)
-    current_nb_of_pieces += 1
-    println()
+@resumable function piece(env::Environment, name::Int, machine::Resource, current_nbo::Ref{Int})  # ← manquait current_nbo en argument
+    current_nbo[] += 1               # ← syntaxe Ref
     push!(times, now(env))
     push!(nb_pieces, current_nbo[])
 
@@ -35,13 +34,13 @@ end
         end
         @yield timeout(env, interarrival)
         i += 1
-        @process piece(env, i, machine, current_nbo)
+        @process piece(env, i, machine, current_nbo)  # ← manquait current_nbo
     end
 end
 
 env = Simulation()
 machine = Resource(env, 4)
-@process arrival_process(env, machine, 100.0, current_nbo)
+@process arrival_process(env, machine, 100.0, current_nbo)  # ← current_nbo maintenant défini
 run(env)
 
 function detect_steady_state(times, values; window=20, tol=0.05)
@@ -66,7 +65,7 @@ end
 plot(times, nb_pieces,
      xlabel="Temps",
      ylabel="Nombre de pièces",
-     title="Évolution du système M/M/1",
+     title="Évolution du système M/M/4",
      label="Nb pièces",
      lw=2)
 if t_ss !== nothing
