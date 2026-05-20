@@ -114,46 +114,19 @@ function choisir_employe_pour_machine(atelier::Atelier, machine_id::Int)
     return nothing
 end
 
-function temps_restant_employe(atelier::Atelier, emp_id::Int)
-    emp = atelier.employes[emp_id]
-    if !emp.est_occupe
-        return 0.0
-    end
-    m_id = emp.machine_assignee
-    if m_id === nothing
-        return 0.0
-    end
-    machine = atelier.machines[m_id]
-    if machine.en_service === nothing
-        return 0.0
-    end
-    p = machine.en_service
-    a, b = TEMPS[(p.type, m_id)]
-    temps_moyen = (a + b) / 2
-    temps_deja = now(atelier.sim) - p.arrivee_machine
-    return temps_moyen - temps_deja
-end
-
-# ---------------------------------------------------------------
-# BUG 1 CORRIGÉ : "endfte" → "end"
-# BUG 2 CORRIGÉ : mode_algo est maintenant utilisé pour brancher
-#                 entre FIFO et l'algorithme intelligent
-# ---------------------------------------------------------------
 function choisir_machine(atelier::Atelier, emp_id::Int,
                          mode_algo::String,
                          mode_choix::String)
 
     emp_ref = atelier.employes[emp_id]
 
-    # ---- MODE FIFO : on choisit la machine avec le produit le plus ancien ----
+    # ---- MODE FIFO ----
     if mode_algo == "FIFO_ATELIER"
         meilleure_machine = nothing
         arrivee_min = Inf
         for m_id in emp_ref.qualifications
             machine = atelier.machines[m_id]
-            if isempty(machine.file_attente)
-                continue
-            end
+            isempty(machine.file_attente) && continue
             idx = index_produit_doyen(machine.file_attente)
             t = machine.file_attente[idx].arrivee_atelier
             if t < arrivee_min
@@ -161,59 +134,54 @@ function choisir_machine(atelier::Atelier, emp_id::Int,
                 meilleure_machine = m_id
             end
         end
-        if meilleure_machine !== nothing
+        meilleure_machine !== nothing &&
             log_event(atelier, "FIFO : Employé $emp_id → machine $meilleure_machine")
-        end
         return meilleure_machine
     end
 
-    # ---- MODE INTELLIGENT : on minimise le temps d'attente futur ----
+    # ---- MODE INTELLIGENT ----
+    #
+    # Score à maximiser : âge / durée_estimée
+    #
+    # - Favorise les produits anciens (urgence)
+    # - Favorise les tâches courtes
+    # - Évite l'omission indéfinie d'une tâche: un produit très vieux finit toujours par avoir
+    #   un score suffisant pour être traité, même si sa tâche est longue
+
     meilleure_machine = nothing
-    pire_attente = -Inf
+    meilleur_score    = -Inf
 
     for m_id in emp_ref.qualifications
         machine = atelier.machines[m_id]
-        if isempty(machine.file_attente)
-            continue
-        end
+        isempty(machine.file_attente) && continue
 
-        # Temps d'attente estimé si l'employé courant NE prend PAS cette machine
-        meilleur_temps = Inf
-        for autre_id in 1:length(atelier.employes)
-            if autre_id == emp_id
-                continue
-            end
-            autre = atelier.employes[autre_id]
-            if !(m_id in autre.qualifications)
-                continue
-            end
-            t = temps_restant_employe(atelier, autre_id)
-            if t < meilleur_temps
-                meilleur_temps = t
-            end
-        end
+        idx = index_produit_doyen(machine.file_attente)
+        p   = machine.file_attente[idx]
 
-        # Aucun autre employé qualifié : pénalité maximale
-        if meilleur_temps == Inf
-            meilleur_temps = 1e9
-        end
+        age           = now(atelier.sim) - p.arrivee_atelier
+        a, b          = TEMPS[(p.type, m_id)]
+        duree_estimee = (a + b) / 2.0
 
-        log_event(atelier, "Machine $m_id : attente estimée = $(round(meilleur_temps, digits=3))")
+        # Score: âge pondéré par la durée estimée
+        score = age / duree_estimee
 
-        if meilleur_temps > pire_attente
-            pire_attente = meilleur_temps
+        log_event(atelier,
+            "Machine $m_id : score=$(round(score, digits=3)) " *
+            "(age=$(round(age, digits=3)), durée=$(round(duree_estimee, digits=3)))")
+
+        if score > meilleur_score
+            meilleur_score    = score
             meilleure_machine = m_id
         end
     end
 
-    if meilleure_machine !== nothing
+    meilleure_machine !== nothing &&
         log_event(atelier,
-            "INTELLIGENT : Employé $emp_id → machine $meilleure_machine " *
-            "(attente évitée = $(round(pire_attente, digits=3)))")
-    end
+            "INTELLIGENT  : Employé $emp_id → machine $meilleure_machine " *
+            "(score=$(round(meilleur_score, digits=3)))")
 
     return meilleure_machine
-end  # ← BUG 1 CORRIGÉ : était "endfte"
+end
 
 function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Float64)
     machine = atelier.machines[m_id]
