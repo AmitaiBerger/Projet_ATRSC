@@ -1,7 +1,7 @@
 using SimJulia, Distributions, Random, Statistics, ResumableFunctions, Printf
 using Plots
 
-# --- DONNÉES OFFICIELLES (inchangées) ---
+# --- DONNÉES OFFICIELLES ---
 const λ = [0.29, 0.32, 0.47, 0.38]
 const PARCOURS = [
     [1, 2, 3, 4, 8], # T1
@@ -56,7 +56,7 @@ mutable struct Atelier
     record_history::Bool
     function Atelier(sim, Q, verbose, record_history)
         nb_machines = 8
-        nb_emp = size(Q,1)
+        nb_emp = size(Q, 1)
         machines = [Machine() for _ in 1:nb_machines]
         employes = [Employe(i, findall(j -> Q[i,j]==1, 1:nb_machines)) for i in 1:nb_emp]
         events = [Event(sim) for _ in 1:nb_emp]
@@ -68,7 +68,6 @@ end
 log_event(atelier::Atelier, msg::String) = atelier.verbose && println("[t=$(Printf.@sprintf("%.3f", now(atelier.sim)))] $msg")
 
 # --- FONCTIONS AUXILIAIRES ---
-
 function par_temps_entree(atelier::Atelier, id::Int)
     return atelier.employes[id].temps_entree_salle
 end
@@ -103,174 +102,135 @@ function sortir_salle_attente!(atelier::Atelier, emp_id::Int)
     log_event(atelier, "Employé $emp_id sort de la salle d'attente")
 end
 
-# Nouvelle fonction pour choisir l'employé avec le MOINS de travail cumulé
-function choisir_employe_pour_machine_egalitaire(atelier::Atelier, machine_id::Int)
-    candidats = Int[]
-    for emp_id in atelier.file_inactifs
-        emp = atelier.employes[emp_id]
-        if machine_id in emp.qualifications
-            push!(candidats, emp_id)
+# --- MODIFICATION Q9 : CHOIX DE L'EMPLOYÉ (Politique) ---
+function choisir_employe_pour_machine(atelier::Atelier, machine_id::Int, mode_choix::String)
+    # On identifie les employés en salle d'attente capables de s'occuper de cette machine
+    qualifies = [id for id in atelier.file_inactifs if machine_id in atelier.employes[id].qualifications]
+    
+    isempty(qualifies) && return nothing
+
+    if mode_choix == "MOINS_CHARGE"
+        # Règle Q8 : Sélection de l'employé avec le temps de travail cumulé minimal.
+        # Minimiser (travail / t) à l'instant t revient strictement à minimiser le travail.
+        meilleur_emp = qualifies[1]
+        min_travail = atelier.employes[meilleur_emp].travail_cumule
+        
+        for id in qualifies[2:end]
+            travail = atelier.employes[id].travail_cumule
+            if travail < min_travail
+                min_travail = travail
+                meilleur_emp = id
+            end
         end
+        sortir_salle_attente!(atelier, meilleur_emp)
+        return meilleur_emp
+    else
+        # Fallback classique (le premier qualifié arrivé en salle)
+        emp_id = qualifies[1]
+        sortir_salle_attente!(atelier, emp_id)
+        return emp_id
     end
-    
-    isempty(candidats) && return nothing
-    
-    # Choisir celui avec le plus petit temps de travail cumulé
-    meilleur_id = candidats[1]
-    min_travail = atelier.employes[meilleur_id].travail_cumule
-    
-    for emp_id in candidats[2:end]
-        travail = atelier.employes[emp_id].travail_cumule
-        if travail < min_travail
-            min_travail = travail
-            meilleur_id = emp_id
-        end
-    end
-    
-    sortir_salle_attente!(atelier, meilleur_id)
-    log_event(atelier, "EGALITAIRE: Employé $meilleur_id choisi (travail cumulé=$(round(min_travail, digits=3)))")
-    return meilleur_id
 end
 
-# Nouvelle fonction pour calculer la moyenne des temps de travail HORS un employé donné
-function moyenne_travail_autres(atelier::Atelier, emp_id::Int)
-    autres = [e.travail_cumule for e in atelier.employes if e.id != emp_id]
-    isempty(autres) && return 0.0
-    return mean(autres)
-end
-
-# Nouvelle fonction de choix de machine EGALITAIRE
-function choisir_machine(atelier::Atelier, emp_id::Int,
-                         mode_algo::String,
-                         mode_choix::String)
-
+# --- MODIFICATION Q9 : ROUTAGE (Algorithme 3 cas) ---
+function choisir_machine(atelier::Atelier, emp_id::Int, mode_algo::String, mode_choix::String)
     emp_ref = atelier.employes[emp_id]
 
-    # ---- MODE FIFO (inchangé) ----
-    if mode_algo == "FIFO_ATELIER"
-        meilleure_machine = nothing
-        arrivee_min = Inf
-        for m_id in emp_ref.qualifications
-            machine = atelier.machines[m_id]
-            isempty(machine.file_attente) && continue
-            idx = index_produit_doyen(machine.file_attente)
-            t = machine.file_attente[idx].arrivee_atelier
-            if t < arrivee_min
-                arrivee_min = t
-                meilleur_machine = m_id
-            end
-        end
-        meilleure_machine !== nothing &&
-            log_event(atelier, "FIFO : Employé $emp_id → machine $meilleure_machine")
-        return meilleure_machine
-    end
-
-    # ---- MODE INTELLIGENT (inchangé) ----
-    if mode_algo == "INTELLIGENT"
-        meilleure_machine = nothing
-        meilleur_score    = -Inf
-
-        for m_id in emp_ref.qualifications
-            machine = atelier.machines[m_id]
-            isempty(machine.file_attente) && continue
-
-            idx = index_produit_doyen(machine.file_attente)
-            p   = machine.file_attente[idx]
-
-            age           = now(atelier.sim) - p.arrivee_atelier
-            a, b          = TEMPS[(p.type, m_id)]
-            duree_estimee = (a + b) / 2.0
-            score = age / duree_estimee
-
-            if score > meilleur_score
-                meilleur_score    = score
-                meilleure_machine = m_id
-            end
-        end
-        return meilleure_machine
-    end
-
-    # ---- NOUVEAU MODE EGALITAIRE ----
-    if mode_algo == "EGALITAIRE"
-        travail_actuel = emp_ref.travail_cumule
-        moyenne_autres = moyenne_travail_autres(atelier, emp_id)
+    if mode_algo == "EQUILIBRAGE"
+        machines_candidates = [m for m in emp_ref.qualifications if !isempty(atelier.machines[m].file_attente)]
         
-        meilleure_machine = nothing
-        meilleur_ecart    = Inf  # On veut minimiser |travail_futur - moyenne_autres|
+        # 3ème cas : Aucune tâche possible
+        isempty(machines_candidates) && return nothing
 
-        for m_id in emp_ref.qualifications
-            machine = atelier.machines[m_id]
-            isempty(machine.file_attente) && continue
+        machines_cas1 = Int[]
+        machines_cas2_valides = Int[]
 
-            idx = index_produit_doyen(machine.file_attente)
-            p   = machine.file_attente[idx]
+        # Analyse du statut exclusif ou partagé des machines candidates
+        for m_id in machines_candidates
+            # On cherche les autres employés en salle capables de traiter cette machine
+            autres_dispos = [id for id in atelier.file_inactifs if m_id in atelier.employes[id].qualifications]
 
-            a, b          = TEMPS[(p.type, m_id)]
-            duree_estimee = (a + b) / 2.0
-            
-            # Temps de travail futur si on prend cette tâche
-            travail_futur = travail_actuel + duree_estimee
-            
-            # Écart par rapport à la moyenne des autres
-            ecart = abs(travail_futur - moyenne_autres)
-
-            log_event(atelier,
-                "Machine $m_id : écart=$(round(ecart, digits=3)) " *
-                "(travail_futur=$(round(travail_futur, digits=3)), moyenne_autres=$(round(moyenne_autres, digits=3)))")
-
-            if ecart < meilleur_ecart
-                meilleur_ecart    = ecart
-                meilleure_machine = m_id
+            if isempty(autres_dispos)
+                # 1er cas : Notre employé est le seul à pouvoir s'en occuper maintenant
+                push!(machines_cas1, m_id)
+            else
+                # 2ème cas : Machine partagée. Existe-t-il un collègue moins chargé ?
+                collegue_moins_charge = any(id -> atelier.employes[id].travail_cumule < emp_ref.travail_cumule, autres_dispos)
+                
+                if !collegue_moins_charge
+                    # L'employé actuel reste le plus légitime (le moins chargé ou égal)
+                    push!(machines_cas2_valides, m_id)
+                end
             end
         end
 
-        meilleure_machine !== nothing &&
-            log_event(atelier,
-                "EGALITAIRE : Employé $emp_id → machine $meilleure_machine " *
-                "(écart=$(round(meilleur_ecart, digits=3)))")
+        # Résolution : Priorité absolue au Cas 1 (FIFO entre elles)
+        if !isempty(machines_cas1)
+            meilleure_machine = nothing
+            arrivee_min = Inf
+            for m_id in machines_cas1
+                idx = index_produit_doyen(atelier.machines[m_id].file_attente)
+                t = atelier.machines[m_id].file_attente[idx].arrivee_atelier
+                if t < arrivee_min
+                    arrivee_min = t
+                    meilleure_machine = m_id
+                end
+            end
+            return meilleure_machine
+        end
 
-        return meilleure_machine
+        # Résolution : Cas 2 (FIFO entre les machines partagées validées)
+        if !isempty(machines_cas2_valides)
+            meilleure_machine = nothing
+            arrivee_min = Inf
+            for m_id in machines_cas2_valides
+                idx = index_produit_doyen(atelier.machines[m_id].file_attente)
+                t = atelier.machines[m_id].file_attente[idx].arrivee_atelier
+                if t < arrivee_min
+                    arrivee_min = t
+                    meilleure_machine = m_id
+                end
+            end
+            return meilleure_machine
+        end
+
+        # Si l'employé n'a que des machines du cas 2 et qu'il y a toujours un collègue
+        # moins chargé disponible pour chacune, il cède sa place (retour au cas 3).
+        return nothing
     end
 
-    return nothing
+    return nothing # Fallback sécurisé
 end
 
-
-
-function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Float64, mode_algo::String)
+function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Float64, mode_choix::String)
     machine = atelier.machines[m_id]
     log_event(atelier, "Produit $(p.id) (type $(p.type)) arrive sur machine $m_id (étape $(p.etape))")
     
     if machine.en_service === nothing && !machine.occupee
-        # Choix de l'employé selon le mode
-        emp_id = if mode_algo == "EGALITAIRE"
-            choisir_employe_pour_machine_egalitaire(atelier, m_id)
-        else
-            choisir_employe_pour_machine(atelier, m_id)
-        end
-        
+        emp_id = choisir_employe_pour_machine(atelier, m_id, mode_choix)
         if emp_id !== nothing
             machine.occupee = true
             machine.en_service = p
             atelier.employes[emp_id].machine_assignee = m_id
+            log_event(atelier, "Machine $m_id libre -> Employé $emp_id assigné")
             ev = atelier.events_employes[emp_id]
             if state(ev) == SimJulia.idle
                 succeed(ev)
             end
         else
             push!(machine.file_attente, p)
+            log_event(atelier, "Machine $m_id libre mais aucun employé disponible -> file d'attente")
         end
     else
         push!(machine.file_attente, p)
+        log_event(atelier, "Machine $m_id occupée -> file d'attente")
     end
     return nothing
 end
 
+# --- PROCESSUS DE SIMULATION ---
 
-# --- PROCESSUS ---
-
-@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier,
-                                      mode_algo::String, mode_choix::String)
+@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier, mode_algo::String, mode_choix::String)
     emp = atelier.employes[emp_id]
     while true
         if !emp.est_occupe
@@ -279,27 +239,33 @@ end
                 machine = atelier.machines[m_id]
                 machine.occupee = true
                 emp.est_occupe = true
+                
                 idx_doyen = index_produit_doyen(machine.file_attente)
                 p = machine.file_attente[idx_doyen]
                 deleteat!(machine.file_attente, idx_doyen)
+                
                 machine.en_service = p
                 emp.machine_assignee = m_id
+                
                 duree = rand(Uniform(TEMPS[(p.type, m_id)]...))
-                log_event(atelier, "Employé $emp_id commence service sur machine $m_id pour produit $(p.id) (durée=$(round(duree,digits=3)))")
+                log_event(atelier, "Employé $emp_id commence machine $m_id pour produit $(p.id)")
+                
                 @yield timeout(sim, duree)
+                
                 if now(sim) >= atelier.fin_transitoire
                     emp.travail_cumule += duree
                 end
+                
                 machine.en_service = nothing
                 machine.occupee = false
                 emp.machine_assignee = nothing
                 emp.est_occupe = false
-                log_event(atelier, "Employé $emp_id termine service sur machine $m_id")
+                
                 p.etape += 1
                 if p.etape <= length(PARCOURS[p.type])
                     m_suiv = PARCOURS[p.type][p.etape]
                     p.arrivee_machine = now(sim)
-                    arriver_sur_machine!(atelier, p, m_suiv, now(sim), mode_algo)
+                    arriver_sur_machine!(atelier, p, m_suiv, now(sim), mode_choix)
                 else
                     t_fin = now(sim)
                     ts = t_fin - p.arrivee_atelier
@@ -309,7 +275,6 @@ end
                     if atelier.record_history
                         push!(atelier.temps_sejour_history, (t_fin, ts))
                     end
-                    log_event(atelier, "Produit $(p.id) termine son parcours (temps séjour=$ts)")
                 end
                 continue
             end
@@ -319,31 +284,29 @@ end
             entrer_salle_attente!(atelier, emp_id, now(sim))
             atelier.events_employes[emp_id] = Event(sim)
             ev = atelier.events_employes[emp_id]
-            log_event(atelier, "Employé $emp_id attend un événement (salle d'attente)")
             @yield ev
+            
             m_id = emp.machine_assignee
             emp.machine_assignee = nothing
-            if m_id === nothing
-                error("Employé $emp_id réveillé sans machine assignée")
-            end
             machine = atelier.machines[m_id]
             p = machine.en_service
+            
             duree = rand(Uniform(TEMPS[(p.type, m_id)]...))
-            log_event(atelier, "Employé $emp_id réveillé, commence service sur machine $m_id pour produit $(p.id) (durée=$(round(duree,digits=3)))")
             @yield timeout(sim, duree)
+            
             if now(sim) >= atelier.fin_transitoire
                 emp.travail_cumule += duree
             end
+            
             machine.en_service = nothing
             machine.occupee = false
             emp.est_occupe = false
-            log_event(atelier, "Employé $emp_id termine service sur machine $m_id")
+            
             p.etape += 1
             if p.etape <= length(PARCOURS[p.type])
                 m_suiv = PARCOURS[p.type][p.etape]
                 p.arrivee_machine = now(sim)
-                arriver_sur_machine!(atelier, p, m_suiv, now(sim), mode_algo)
-
+                arriver_sur_machine!(atelier, p, m_suiv, now(sim), mode_choix)
             else
                 t_fin = now(sim)
                 ts = t_fin - p.arrivee_atelier
@@ -353,37 +316,34 @@ end
                 if atelier.record_history
                     push!(atelier.temps_sejour_history, (t_fin, ts))
                 end
-                log_event(atelier, "Produit $(p.id) termine son parcours (temps séjour=$ts)")
             end
             continue
         end
     end
 end
 
-@resumable function generateur(sim::Simulation, type::Int, atelier::Atelier)
+@resumable function generateur(sim::Simulation, type::Int, atelier::Atelier, mode_choix::String)
     while true
         @yield timeout(sim, rand(Exponential(1/λ[type])))
         atelier.compteur_produits += 1
         t_now = now(sim)
         p = Produit(atelier.compteur_produits, type, t_now, t_now, 1)
-        log_event(atelier, "Nouveau produit $(p.id) de type $type arrive dans l'atelier")
         premiere_machine = PARCOURS[type][1]
-        arriver_sur_machine!(atelier, p, m_suiv, now(sim), mode_algo)
-
+        arriver_sur_machine!(atelier, p, premiere_machine, t_now, mode_choix)
     end
 end
 
 @resumable function processus_reinitialisation(sim::Simulation, atelier::Atelier, duree_transient::Float64)
     @yield timeout(sim, duree_transient)
-    log_event(atelier, "=== FIN PÉRIODE TRANSITOIRE (t=$duree_transient) - RÉINITIALISATION STATISTIQUES ===")
+    log_event(atelier, "=== FIN PÉRIODE TRANSITOIRE - RÉINITIALISATION STATISTIQUES ===")
     for emp in atelier.employes
         emp.travail_cumule = 0.0
     end
 end
 
-# --- FONCTION DE SIMULATION ---
+# --- MOTEUR D'ÉVALUATION ---
 
-function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_TOT_ATELIER",
+function etude_performance(Q, label, mode_algo="EQUILIBRAGE", mode_choix="MOINS_CHARGE",
                            n_runs=20, duree_transient=10000.0, duree_permanent=1000.0;
                            verbose=false, plot_convergence=false)
     sejours_moyens = Float64[]
@@ -392,7 +352,6 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
 
     for r in 1:n_runs
         record_this_run = plot_convergence && (r == 1)
-        verbose && println("\n--- RUN $r ---")
         sim = Simulation()
         atelier = Atelier(sim, Q, verbose, record_this_run)
         atelier.fin_transitoire = duree_transient
@@ -403,7 +362,7 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
             @process processus_employe(sim, i, atelier, mode_algo, mode_choix)
         end
         for t in 1:4
-            @process generateur(sim, t, atelier)
+            @process generateur(sim, t, atelier, mode_choix)
         end
 
         run(sim, duree_transient + duree_permanent)
@@ -413,23 +372,6 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
         end
         for i in 1:nb_emp
             push!(occupations[i], atelier.employes[i].travail_cumule / duree_permanent * 100)
-        end
-        verbose && println("Fin run $r : produits terminés en phase permanente = $(length(atelier.temps_sejour))")
-
-        if record_this_run && !isempty(atelier.temps_sejour_history)
-            history = atelier.temps_sejour_history
-            sort!(history, by = x -> x[1])
-            temps = [t for (t, _) in history]
-            sejours = [s for (_, s) in history]
-            cum_mean = cumsum(sejours) ./ (1:length(sejours))
-            p = plot(temps, cum_mean,
-                     label = "Moyenne cumulée",
-                     xlabel = "Temps simulé",
-                     ylabel = "Temps de séjour moyen",
-                     title = "Convergence - Instance $label | Algo: $mode_algo (Run 1)")
-            vline!([duree_transient], linestyle=:dash, color=:red, label="Fin transitoire (t=$duree_transient)")
-            display(p)
-            println("Graphique de convergence affiché pour l'instance $label.")
         end
     end
 
@@ -443,25 +385,17 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
     @printf(" > Occupation employés   : %s\n", join([@sprintf("%.1f%%", x) for x in occ_moy], ", "))
 end
 
-# --- EXÉCUTION ---
+# --- CONFIGURATION ET EXÉCUTION ---
 Q1 = [1 1 0 0 0 0 0 0; 0 0 1 1 0 0 0 0; 0 0 0 0 1 1 0 0; 0 0 0 0 0 0 1 1]
 Q2 = [1 0 1 0 0 1 0 0; 0 1 0 0 1 0 1 1; 0 1 0 1 1 0 0 1; 1 0 1 1 0 1 1 0]
-Q3 = [1 1 0 0 0 0 0 0; 0 0 1 0 0 0 0 0; 0 0 0 1 0 1 0 0; 0 0 0 0 1 0 0 1; 0 0 1 0 0 1 0 0; 1 0 0 0 0 0 1 0]
+Q3 = [1 1 0 0 0 0 0 0; 0 0 1 0 0 0 0 0; 0 0 0 1 0 1 0 0; 0 0 0 0 1 0 0 1; 0 0 1 0 1 1 0 0; 1 0 0 0 0 0 1 0]
 Q4 = [1 1 1 0 0 0 0 0; 0 0 0 1 1 1 0 0; 1 0 1 0 0 1 1 1; 0 0 1 0 1 0 1 1; 0 1 0 0 0 1 1 0; 1 0 0 1 0 0 1 1]
 
 Random.seed!(123)
 println("="^60)
-println("ALGO FIFO (Q4)")
+println("ALGO EQUILIBRAGE DES CHARGES (Q9)")
 println("="^60)
-etude_performance(Q1, "I1", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
-etude_performance(Q2, "I2", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
-etude_performance(Q3, "I3", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
-etude_performance(Q4, "I4", "FIFO_ATELIER", "PLUS_TOT_ATELIER", plot_convergence=true)
-
-println("="^60)
-println("ALGO EGALITAIRE (Q7)")
-println("="^60)
-etude_performance(Q1, "I1", "EGALITAIRE", "PLUS_TOT_ATELIER")
-etude_performance(Q2, "I2", "EGALITAIRE", "PLUS_TOT_ATELIER")
-etude_performance(Q3, "I3", "EGALITAIRE", "PLUS_TOT_ATELIER")
-etude_performance(Q4, "I4", "EGALITAIRE", "PLUS_TOT_ATELIER")
+etude_performance(Q1, "I1", "EQUILIBRAGE", "MOINS_CHARGE")
+etude_performance(Q2, "I2", "EQUILIBRAGE", "MOINS_CHARGE")
+etude_performance(Q3, "I3", "EQUILIBRAGE", "MOINS_CHARGE")
+etude_performance(Q4, "I4", "EQUILIBRAGE", "MOINS_CHARGE")
